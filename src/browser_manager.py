@@ -1,532 +1,387 @@
-"""Browser instance management with nodriver."""
+"""Browser instance management via browser.proxies.sx HTTP API.
+
+Adapted from nodriver-based local browser management to cloud antidetect
+browser sessions with auto-allocated mobile proxy and Identity Bundles.
+
+Original: https://github.com/vibheksoni/stealth-browser-mcp
+Adapted for: https://browser.proxies.sx
+"""
 
 import asyncio
-import uuid
-from typing import Dict, Optional, List
-from datetime import datetime, timedelta
+import os
+import json
+from typing import Dict, Optional, List, Any
+from datetime import datetime
 
-import nodriver as uc
-from nodriver import Browser, Tab
+import aiohttp
 
-from debug_logger import debug_logger
 from models import BrowserInstance, BrowserState, BrowserOptions, PageState
-from persistent_storage import persistent_storage
-from dynamic_hook_system import dynamic_hook_system
-from platform_utils import get_platform_info, check_browser_executable
-from process_cleanup import process_cleanup
+
+
+API_BASE = os.environ.get("BROWSER_API_URL", "https://browser.proxies.sx")
 
 
 class BrowserManager:
-    """Manages multiple browser instances."""
+    """Manages browser sessions via browser.proxies.sx API."""
 
     def __init__(self):
         self._instances: Dict[str, dict] = {}
         self._lock = asyncio.Lock()
+        self._http: Optional[aiohttp.ClientSession] = None
+
+    async def _get_http(self) -> aiohttp.ClientSession:
+        if self._http is None or self._http.closed:
+            self._http = aiohttp.ClientSession()
+        return self._http
 
     async def spawn_browser(self, options: BrowserOptions) -> BrowserInstance:
         """
-        Spawn a new browser instance with given options.
-
-        Args:
-            options (BrowserOptions): Options for browser configuration.
-
-        Returns:
-            BrowserInstance: The spawned browser instance.
+        Create a new browser session via browser.proxies.sx API.
+        Requires x402 USDC payment or an internal key.
         """
-        instance_id = str(uuid.uuid4())
-
         instance = BrowserInstance(
-            instance_id=instance_id,
-            headless=options.headless,
+            instance_id="pending",
+            headless=True,
             user_agent=options.user_agent,
-            viewport={"width": options.viewport_width, "height": options.viewport_height}
+            viewport={"width": options.viewport_width, "height": options.viewport_height},
         )
 
         try:
-            platform_info = get_platform_info()
-            
-            # Detect the best available browser executable (Chrome, Chromium, or Edge)
-            browser_executable = check_browser_executable()
-            if not browser_executable:
-                raise Exception("No compatible browser found (Chrome, Chromium, or Microsoft Edge)")
-            
-            # Identify browser type for logging
-            browser_type = "Unknown"
-            if 'edge' in browser_executable.lower() or 'msedge' in browser_executable.lower():
-                browser_type = "Microsoft Edge"
-            elif 'chromium' in browser_executable.lower():
-                browser_type = "Chromium"
-            elif 'chrome' in browser_executable.lower():
-                browser_type = "Google Chrome"
-            
-            debug_logger.log_info(
-                "browser_manager",
-                "spawn_browser",
-                f"Platform: {platform_info['system']} | Root: {platform_info['is_root']} | Container: {platform_info['is_container']} | Sandbox: {options.sandbox} | Browser: {browser_type} ({browser_executable})"
-            )
-            
-            config = uc.Config(
-                headless=options.headless,
-                user_data_dir=options.user_data_dir,
-                sandbox=options.sandbox,
-                browser_executable_path=browser_executable
-            )
+            http = await self._get_http()
 
-            browser = await uc.start(config=config)
-            tab = browser.main_tab
-
-            if hasattr(browser, '_process') and browser._process:
-                process_cleanup.track_browser_process(instance_id, browser._process)
+            body: Dict[str, Any] = {}
+            if hasattr(options, "country") and options.country:
+                body["country"] = options.country
+            if hasattr(options, "duration_minutes") and options.duration_minutes:
+                body["durationMinutes"] = options.duration_minutes
             else:
-                debug_logger.log_warning("browser_manager", "spawn_browser", 
-                                       f"Browser {instance_id} has no process to track")
+                body["durationMinutes"] = 60
+            if hasattr(options, "profile_id") and options.profile_id:
+                body["profile_id"] = options.profile_id
 
-            if options.user_agent:
-                await tab.send(uc.cdp.emulation.set_user_agent_override(
-                    user_agent=options.user_agent
-                ))
+            headers: Dict[str, str] = {"Content-Type": "application/json"}
 
-            if options.extra_headers:
-                await tab.send(uc.cdp.network.set_extra_http_headers(
-                    headers=options.extra_headers
-                ))
+            payment_sig = getattr(options, "payment_signature", None) or os.environ.get("PAYMENT_SIGNATURE")
+            if payment_sig:
+                headers["Payment-Signature"] = payment_sig
 
-            await tab.set_window_size(
-                left=0,
-                top=0, 
-                width=options.viewport_width,
-                height=options.viewport_height
-            )
-            print(f"[DEBUG] Set viewport to {options.viewport_width}x{options.viewport_height}")
+            internal_key = os.environ.get("BROWSER_INTERNAL_KEY")
+            if internal_key:
+                headers["X-Internal-Key"] = internal_key
 
-            await self._setup_dynamic_hooks(tab, instance_id)
+            async with http.post(f"{API_BASE}/v1/sessions", json=body, headers=headers) as resp:
+                data = await resp.json()
 
-            async with self._lock:
-                self._instances[instance_id] = {
-                    'browser': browser,
-                    'tab': tab,
-                    'instance': instance,
-                    'options': options,
-                    'network_data': []
-                }
+                if resp.status == 402:
+                    instance.state = BrowserState.ERROR
+                    instance.instance_id = "payment_required"
+                    async with self._lock:
+                        self._instances["payment_required"] = {
+                            "instance": instance,
+                            "session_id": None,
+                            "session_token": None,
+                            "payment_info": data,
+                        }
+                    raise PaymentRequiredError(data)
 
-            instance.state = BrowserState.READY
-            instance.update_activity()
+                if resp.status not in (200, 201):
+                    raise Exception(data.get("error", f"API error {resp.status}"))
 
-            persistent_storage.store_instance(instance_id, {
-                'state': instance.state.value,
-                'created_at': instance.created_at.isoformat(),
-                'current_url': getattr(tab, 'url', ''),
-                'title': 'Browser Instance'
-            })
+                session_id = data.get("session_id")
+                session_token = data.get("session_token", session_id)
 
+                instance.instance_id = session_id
+                instance.state = BrowserState.READY
+
+                async with self._lock:
+                    self._instances[session_id] = {
+                        "instance": instance,
+                        "session_id": session_id,
+                        "session_token": session_token,
+                        "expires_at": data.get("expires_at") or data.get("expiresAt"),
+                        "proxy": data.get("proxy", {}),
+                        "fingerprint": data.get("fingerprint", {}),
+                        "loaded_profile_id": data.get("loaded_profile_id"),
+                    }
+
+            return instance
+
+        except PaymentRequiredError:
+            raise
         except Exception as e:
             instance.state = BrowserState.ERROR
-            raise Exception(f"Failed to spawn browser: {str(e)}")
+            raise Exception(f"Failed to create browser session: {str(e)}")
 
-        return instance
-    
-    async def _setup_dynamic_hooks(self, tab: Tab, instance_id: str):
-        """Setup dynamic hook system for browser instance."""
-        try:
-            dynamic_hook_system.add_instance(instance_id)
-            
-            await dynamic_hook_system.setup_interception(tab, instance_id)
-            
-            debug_logger.log_info("browser_manager", "_setup_dynamic_hooks", f"Dynamic hook system setup complete for instance {instance_id}")
-            
-        except Exception as e:
-            debug_logger.log_error("browser_manager", "_setup_dynamic_hooks", f"Failed to setup dynamic hooks for {instance_id}: {e}")
-
-    async def get_instance(self, instance_id: str) -> Optional[dict]:
-        """
-        Get browser instance by ID.
-
-        Args:
-            instance_id (str): The ID of the browser instance.
-
-        Returns:
-            Optional[dict]: The browser instance data if found, else None.
-        """
+    async def send_command(
+        self, instance_id: str, action: str, params: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """Send a command to the browser session."""
         async with self._lock:
-            return self._instances.get(instance_id)
+            session = self._instances.get(instance_id)
+        if not session:
+            raise Exception(f"No browser instance: {instance_id}")
 
-    async def list_instances(self) -> List[BrowserInstance]:
-        """
-        List all browser instances.
+        http = await self._get_http()
+        sid = session["session_id"]
+        token = session["session_token"]
 
-        Returns:
-            List[BrowserInstance]: List of all browser instances.
-        """
+        body: Dict[str, Any] = {"action": action}
+        if params:
+            body.update(params)
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        }
+
+        async with http.post(
+            f"{API_BASE}/v1/sessions/{sid}/command", json=body, headers=headers
+        ) as resp:
+            data = await resp.json()
+            if resp.status != 200:
+                raise Exception(data.get("error", f"Command failed: {resp.status}"))
+            return data
+
+    async def navigate(self, instance_id: str, url: str, wait_until: str = "domcontentloaded") -> Dict[str, Any]:
+        """Navigate to a URL."""
+        result = await self.send_command(instance_id, "navigate", {"url": url, "wait_until": wait_until})
         async with self._lock:
-            return [data['instance'] for data in self._instances.values()]
+            session = self._instances.get(instance_id)
+            if session:
+                session["instance"].current_url = result.get("url", url)
+                session["instance"].title = result.get("title", "")
+                session["instance"].state = BrowserState.READY
+                session["instance"].update_activity()
+        return result
 
-    async def close_instance(self, instance_id: str) -> bool:
-        """
-        Close and remove a browser instance.
+    async def click(self, instance_id: str, selector: str) -> Dict[str, Any]:
+        return await self.send_command(instance_id, "click", {"selector": selector})
 
-        Args:
-            instance_id (str): The ID of the browser instance to close.
+    async def type_text(self, instance_id: str, selector: str, text: str, human_like: bool = True) -> Dict[str, Any]:
+        action = "type_slow" if human_like else "type"
+        return await self.send_command(instance_id, action, {"selector": selector, "text": text})
 
-        Returns:
-            bool: True if closed successfully, False otherwise.
-        """
-        import asyncio
-        
-        async def _do_close():
-            async with self._lock:
-                if instance_id not in self._instances:
-                    return False
+    async def screenshot(self, instance_id: str, full_page: bool = False) -> Dict[str, Any]:
+        return await self.send_command(instance_id, "screenshot", {"full_page": full_page})
 
-                data = self._instances[instance_id]
-                browser = data['browser']
-                instance = data['instance']
+    async def get_content(self, instance_id: str) -> Dict[str, Any]:
+        return await self.send_command(instance_id, "content")
 
-                try:
-                    if hasattr(browser, 'tabs') and browser.tabs:
-                        for tab in browser.tabs[:]:
-                            try:
-                                await tab.close()
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
+    async def get_text(self, instance_id: str, selector: str = "body") -> Dict[str, Any]:
+        return await self.send_command(instance_id, "text", {"selector": selector})
 
-                try:
-                    import asyncio
-                    if hasattr(browser, 'connection') and browser.connection:
-                        asyncio.get_event_loop().create_task(browser.connection.disconnect())
-                        debug_logger.log_info("browser_manager", "close_connection", "closed connection using get_event_loop().create_task()")
-                except RuntimeError:
-                    try:
-                        import asyncio
-                        if hasattr(browser, 'connection') and browser.connection:
-                            await asyncio.wait_for(browser.connection.disconnect(), timeout=2.0)
-                            debug_logger.log_info("browser_manager", "close_connection", "closed connection with direct await and timeout")
-                    except (asyncio.TimeoutError, Exception) as e:
-                        debug_logger.log_info("browser_manager", "close_connection", f"connection disconnect failed or timed out: {e}")
-                        pass
-                except Exception as e:
-                    debug_logger.log_info("browser_manager", "close_connection", f"connection disconnect failed: {e}")
-                    pass
+    async def execute_script(self, instance_id: str, script: str) -> Dict[str, Any]:
+        return await self.send_command(instance_id, "evaluate", {"script": script})
 
-                try:
-                    import nodriver.cdp.browser as cdp_browser
-                    if hasattr(browser, 'connection') and browser.connection:
-                        await browser.connection.send(cdp_browser.close())
-                except Exception:
-                    pass
+    async def get_cookies(self, instance_id: str) -> Dict[str, Any]:
+        return await self.send_command(instance_id, "cookies")
 
-                try:
-                    process_cleanup.kill_browser_process(instance_id)
-                except Exception as e:
-                    debug_logger.log_warning("browser_manager", "close_instance", 
-                                           f"Process cleanup failed for {instance_id}: {e}")
+    async def set_cookie(self, instance_id: str, cookie: Dict[str, Any]) -> Dict[str, Any]:
+        return await self.send_command(instance_id, "set_cookie", {"cookie": cookie})
 
-                try:
-                    await browser.stop()
-                except Exception:
-                    pass
+    async def clear_cookies(self, instance_id: str) -> Dict[str, Any]:
+        return await self.send_command(instance_id, "clear_cookies")
 
-                if hasattr(browser, '_process') and browser._process and browser._process.returncode is None:
-                    import os
+    async def get_local_storage(self, instance_id: str) -> Dict[str, Any]:
+        return await self.send_command(instance_id, "local_storage")
 
-                    for attempt in range(3):
-                        try:
-                            browser._process.terminate()
-                            debug_logger.log_info("browser_manager", "terminate_process", f"terminated browser with pid {browser._process.pid} successfully on attempt {attempt + 1}")
-                            break
-                        except Exception:
-                            try:
-                                browser._process.kill()
-                                debug_logger.log_info("browser_manager", "kill_process", f"killed browser with pid {browser._process.pid} successfully on attempt {attempt + 1}")
-                                break
-                            except Exception:
-                                try:
-                                    if hasattr(browser, '_process_pid') and browser._process_pid:
-                                        os.kill(browser._process_pid, 15)
-                                        debug_logger.log_info("browser_manager", "kill_process", f"killed browser with pid {browser._process_pid} using signal 15 successfully on attempt {attempt + 1}")
-                                        break
-                                except (PermissionError, ProcessLookupError) as e:
-                                    debug_logger.log_info("browser_manager", "kill_process", f"browser already stopped or no permission to kill: {e}")
-                                    break
-                                except Exception as e:
-                                    if attempt == 2:
-                                        debug_logger.log_error("browser_manager", "kill_process", e)
+    async def set_local_storage(self, instance_id: str, items: Dict[str, str]) -> Dict[str, Any]:
+        return await self.send_command(instance_id, "set_local_storage", {"items": items})
 
-                try:
-                    if hasattr(browser, '_process'):
-                        browser._process = None
-                    if hasattr(browser, '_process_pid'):
-                        browser._process_pid = None
+    async def wait_for_element(self, instance_id: str, selector: str, timeout: int = 10000) -> Dict[str, Any]:
+        return await self.send_command(instance_id, "wait", {"selector": selector, "timeout": timeout})
 
-                    instance.state = BrowserState.CLOSED
-                except Exception:
-                    pass
+    async def press_key(self, instance_id: str, key: str) -> Dict[str, Any]:
+        return await self.send_command(instance_id, "press", {"key": key})
 
-                del self._instances[instance_id]
+    async def scroll(self, instance_id: str, x: int = 0, y: int = 0) -> Dict[str, Any]:
+        return await self.send_command(instance_id, "scroll", {"x": x, "y": y})
 
-                persistent_storage.remove_instance(instance_id)
+    # --- Identity Bundle Methods ---
 
-                return True
-        
+    async def save_profile(self, instance_id: str, name: Optional[str] = None) -> Dict[str, Any]:
+        """Save Identity Bundle (cookies + localStorage + fingerprint + proxy binding)."""
+        async with self._lock:
+            session = self._instances.get(instance_id)
+        if not session:
+            raise Exception(f"No browser instance: {instance_id}")
+
+        http = await self._get_http()
+        sid = session["session_id"]
+        token = session["session_token"]
+        body = {"name": name} if name else {}
+
+        async with http.post(
+            f"{API_BASE}/v1/sessions/{sid}/profile",
+            json=body,
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+        ) as resp:
+            data = await resp.json()
+            if resp.status != 200:
+                raise Exception(data.get("error", f"Save profile failed: {resp.status}"))
+            return data
+
+    async def load_profile(self, instance_id: str, profile_id: str) -> Dict[str, Any]:
+        """Load Identity Bundle into current session."""
+        async with self._lock:
+            session = self._instances.get(instance_id)
+        if not session:
+            raise Exception(f"No browser instance: {instance_id}")
+
+        http = await self._get_http()
+        sid = session["session_id"]
+        token = session["session_token"]
+
+        async with http.post(
+            f"{API_BASE}/v1/sessions/{sid}/profile/load",
+            json={"profile_id": profile_id},
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+        ) as resp:
+            data = await resp.json()
+            if resp.status != 200:
+                raise Exception(data.get("error", f"Load profile failed: {resp.status}"))
+            return data
+
+    async def list_profiles(self, instance_id: str) -> Dict[str, Any]:
+        """List all saved Identity Bundle profiles."""
+        async with self._lock:
+            session = self._instances.get(instance_id)
+        if not session:
+            raise Exception(f"No browser instance: {instance_id}")
+
+        http = await self._get_http()
+        token = session["session_token"]
+
+        async with http.get(
+            f"{API_BASE}/v1/profiles",
+            headers={"Authorization": f"Bearer {token}"},
+        ) as resp:
+            data = await resp.json()
+            if resp.status != 200:
+                raise Exception(data.get("error", f"List profiles failed: {resp.status}"))
+            return data
+
+    async def delete_profile(self, profile_id: str, instance_id: str) -> Dict[str, Any]:
+        """Delete a saved profile."""
+        async with self._lock:
+            session = self._instances.get(instance_id)
+        if not session:
+            raise Exception(f"No browser instance: {instance_id}")
+
+        http = await self._get_http()
+        token = session["session_token"]
+
+        async with http.delete(
+            f"{API_BASE}/v1/profiles/{profile_id}",
+            headers={"Authorization": f"Bearer {token}"},
+        ) as resp:
+            data = await resp.json()
+            if resp.status != 200:
+                raise Exception(data.get("error", f"Delete profile failed: {resp.status}"))
+            return data
+
+    # --- Session Management ---
+
+    def get_instance(self, instance_id: str) -> Optional[BrowserInstance]:
+        session = self._instances.get(instance_id)
+        return session["instance"] if session else None
+
+    def get_session_data(self, instance_id: str) -> Optional[dict]:
+        return self._instances.get(instance_id)
+
+    def get_tab(self, instance_id: str):
+        """Compatibility shim — returns proxy object that routes to API."""
+        return APITab(self, instance_id)
+
+    async def get_page_state(self, instance_id: str) -> PageState:
+        cookies_data = await self.get_cookies(instance_id)
+        session = self._instances.get(instance_id)
+        inst = session["instance"] if session else None
+
+        return PageState(
+            instance_id=instance_id,
+            url=inst.current_url or "" if inst else "",
+            title=inst.title or "" if inst else "",
+            ready_state="complete",
+            cookies=cookies_data.get("cookies", []),
+            viewport=inst.viewport if inst else {"width": 1920, "height": 1080},
+        )
+
+    async def close_browser(self, instance_id: str) -> bool:
+        async with self._lock:
+            session = self._instances.get(instance_id)
+        if not session:
+            return False
+
         try:
-            return await asyncio.wait_for(_do_close(), timeout=5.0)
-        except asyncio.TimeoutError:
-            debug_logger.log_info("browser_manager", "close_instance", f"Close timeout for {instance_id}, forcing cleanup")
-            try:
-                async with self._lock:
-                    if instance_id in self._instances:
-                        data = self._instances[instance_id]
-                        data['instance'].state = BrowserState.CLOSED
-                        del self._instances[instance_id]
-                        persistent_storage.remove_instance(instance_id)
-            except Exception:
+            http = await self._get_http()
+            sid = session["session_id"]
+            token = session["session_token"]
+            async with http.delete(
+                f"{API_BASE}/v1/sessions/{sid}",
+                headers={"Authorization": f"Bearer {token}"},
+            ) as resp:
                 pass
+            async with self._lock:
+                del self._instances[instance_id]
             return True
-        except Exception as e:
-            debug_logger.log_error("browser_manager", "close_instance", e)
-            return False
-
-    async def get_tab(self, instance_id: str) -> Optional[Tab]:
-        """
-        Get the main tab for a browser instance.
-
-        Args:
-            instance_id (str): The ID of the browser instance.
-
-        Returns:
-            Optional[Tab]: The main tab if found, else None.
-        """
-        data = await self.get_instance(instance_id)
-        if data:
-            return data['tab']
-        return None
-
-    async def get_browser(self, instance_id: str) -> Optional[Browser]:
-        """
-        Get the browser object for an instance.
-
-        Args:
-            instance_id (str): The ID of the browser instance.
-
-        Returns:
-            Optional[Browser]: The browser object if found, else None.
-        """
-        data = await self.get_instance(instance_id)
-        if data:
-            return data['browser']
-        return None
-
-    async def list_tabs(self, instance_id: str) -> List[Dict[str, str]]:
-        """
-        List all tabs for a browser instance.
-
-        Args:
-            instance_id (str): The ID of the browser instance.
-
-        Returns:
-            List[Dict[str, str]]: List of tab information dictionaries.
-        """
-        browser = await self.get_browser(instance_id)
-        if not browser:
-            return []
-
-        await browser.update_targets()
-
-        tabs = []
-        for tab in browser.tabs:
-            await tab
-            tabs.append({
-                'tab_id': str(tab.target.target_id),
-                'url': getattr(tab, 'url', '') or '',
-                'title': getattr(tab.target, 'title', '') or 'Untitled',
-                'type': getattr(tab.target, 'type_', 'page')
-            })
-
-        return tabs
-
-    async def switch_to_tab(self, instance_id: str, tab_id: str) -> bool:
-        """
-        Switch to a specific tab by bringing it to front.
-
-        Args:
-            instance_id (str): The ID of the browser instance.
-            tab_id (str): The target ID of the tab to switch to.
-
-        Returns:
-            bool: True if switched successfully, False otherwise.
-        """
-        browser = await self.get_browser(instance_id)
-        if not browser:
-            return False
-
-        await browser.update_targets()
-
-        target_tab = None
-        for tab in browser.tabs:
-            if str(tab.target.target_id) == tab_id:
-                target_tab = tab
-                break
-
-        if not target_tab:
-            return False
-
-        try:
-            await target_tab.bring_to_front()
+        except Exception:
             async with self._lock:
                 if instance_id in self._instances:
-                    self._instances[instance_id]['tab'] = target_tab
-
+                    del self._instances[instance_id]
             return True
-        except Exception:
-            return False
 
-    async def get_active_tab(self, instance_id: str) -> Optional[Tab]:
-        """
-        Get the currently active tab.
-
-        Args:
-            instance_id (str): The ID of the browser instance.
-
-        Returns:
-            Optional[Tab]: The active tab if found, else None.
-        """
-        return await self.get_tab(instance_id)
-
-    async def close_tab(self, instance_id: str, tab_id: str) -> bool:
-        """
-        Close a specific tab.
-
-        Args:
-            instance_id (str): The ID of the browser instance.
-            tab_id (str): The target ID of the tab to close.
-
-        Returns:
-            bool: True if closed successfully, False otherwise.
-        """
-        browser = await self.get_browser(instance_id)
-        if not browser:
-            return False
-
-        target_tab = None
-        for tab in browser.tabs:
-            if str(tab.target.target_id) == tab_id:
-                target_tab = tab
-                break
-
-        if not target_tab:
-            return False
-
-        try:
-            await target_tab.close()
-            return True
-        except Exception:
-            return False
-
-    async def update_instance_state(self, instance_id: str, url: str = None, title: str = None):
-        """
-        Update instance state after navigation or action.
-
-        Args:
-            instance_id (str): The ID of the browser instance.
-            url (str, optional): The current URL to update.
-            title (str, optional): The title to update.
-        """
+    async def close_all(self):
         async with self._lock:
-            if instance_id in self._instances:
-                instance = self._instances[instance_id]['instance']
-                if url:
-                    instance.current_url = url
-                if title:
-                    instance.title = title
-                instance.update_activity()
-
-    async def get_page_state(self, instance_id: str) -> Optional[PageState]:
-        """
-        Get complete page state for an instance.
-
-        Args:
-            instance_id (str): The ID of the browser instance.
-
-        Returns:
-            Optional[PageState]: The page state if available, else None.
-        """
-        tab = await self.get_tab(instance_id)
-        if not tab:
-            return None
-
-        try:
-            url = await tab.evaluate("window.location.href")
-            title = await tab.evaluate("document.title")
-            ready_state = await tab.evaluate("document.readyState")
-
-            cookies = await tab.send(uc.cdp.network.get_cookies())
-
-            local_storage = {}
-            session_storage = {}
-
+            ids = list(self._instances.keys())
+        for iid in ids:
             try:
-                local_storage_keys = await tab.evaluate("Object.keys(localStorage)")
-                for key in local_storage_keys:
-                    value = await tab.evaluate(f"localStorage.getItem('{key}')")
-                    local_storage[key] = value
-
-                session_storage_keys = await tab.evaluate("Object.keys(sessionStorage)")
-                for key in session_storage_keys:
-                    value = await tab.evaluate(f"sessionStorage.getItem('{key}')")
-                    session_storage[key] = value
+                await self.close_browser(iid)
             except Exception:
                 pass
 
-            viewport = await tab.evaluate("""
-                ({
-                    width: window.innerWidth,
-                    height: window.innerHeight,
-                    devicePixelRatio: window.devicePixelRatio
-                })
-            """)
+    def list_instances(self) -> List[BrowserInstance]:
+        return [s["instance"] for s in self._instances.values() if s.get("instance")]
 
-            return PageState(
-                instance_id=instance_id,
-                url=url,
-                title=title,
-                ready_state=ready_state,
-                cookies=cookies.get('cookies', []),
-                local_storage=local_storage,
-                session_storage=session_storage,
-                viewport=viewport
-            )
+    async def cleanup(self):
+        await self.close_all()
+        if self._http and not self._http.closed:
+            await self._http.close()
 
-        except Exception as e:
-            raise Exception(f"Failed to get page state: {str(e)}")
 
-    async def cleanup_inactive(self, timeout_minutes: int = 30):
-        """
-        Clean up inactive browser instances.
+class APITab:
+    """Compatibility shim that mimics a nodriver Tab for code that expects it."""
 
-        Args:
-            timeout_minutes (int, optional): Timeout in minutes to consider an instance inactive. Defaults to 30.
-        """
-        now = datetime.now()
-        timeout = timedelta(minutes=timeout_minutes)
+    def __init__(self, manager: BrowserManager, instance_id: str):
+        self._manager = manager
+        self._instance_id = instance_id
 
-        to_close = []
-        async with self._lock:
-            for instance_id, data in self._instances.items():
-                instance = data['instance']
-                if now - instance.last_activity > timeout:
-                    to_close.append(instance_id)
+    async def evaluate(self, script: str):
+        result = await self._manager.execute_script(self._instance_id, script)
+        return result.get("result")
 
-        for instance_id in to_close:
-            await self.close_instance(instance_id)
+    async def get(self, url: str):
+        return await self._manager.navigate(self._instance_id, url)
 
-    async def close_all(self):
-        """
-        Close all browser instances.
+    async def send(self, *args, **kwargs):
+        raise NotImplementedError(
+            "Direct CDP commands not available in cloud browser mode. "
+            "Use browser_manager.send_command() or execute_script() instead."
+        )
 
-        Closes all currently managed browser instances.
-        """
-        instance_ids = list(self._instances.keys())
-        for instance_id in instance_ids:
-            await self.close_instance(instance_id)
+
+class PaymentRequiredError(Exception):
+    """Raised when x402 payment is required."""
+
+    def __init__(self, payment_info: dict):
+        self.payment_info = payment_info
+        networks = payment_info.get("networks", [])
+        addrs = ", ".join(f"{n.get('network')}: {n.get('address')}" for n in networks)
+        price = payment_info.get("price", 0)
+        if isinstance(price, (int, float)) and price > 1000:
+            price_usd = price / 1_000_000
+        elif isinstance(price, dict):
+            price_usd = float(price.get("amount", 0))
+        else:
+            price_usd = float(price)
+        super().__init__(f"Payment required: ${price_usd:.3f} USDC. Send to: {addrs}")
